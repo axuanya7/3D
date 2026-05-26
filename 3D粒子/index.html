@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D 粒子手势交互</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif}
+canvas#three{display:block;width:100%;height:100%}
+#cam-box{position:fixed;bottom:16px;left:16px;width:220px;border-radius:12px;overflow:hidden;border:2px solid rgba(0,200,255,.25);background:#111;z-index:10}
+#cam-box video{display:none}
+#cam-box canvas{width:100%;display:block}
+#cam-label{position:absolute;top:6px;left:8px;font-size:11px;color:#0cf;background:rgba(0,0,0,.65);padding:2px 8px;border-radius:8px;pointer-events:none}
+#gesture-badge{position:fixed;top:18px;left:50%;transform:translateX(-50%);font-size:20px;color:#fff;background:rgba(0,0,0,.55);padding:8px 28px;border-radius:28px;border:1px solid rgba(0,200,255,.3);z-index:10;pointer-events:none;transition:all .3s;letter-spacing:1px}
+#panel{position:fixed;top:16px;right:16px;background:rgba(8,8,24,.82);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(0,200,255,.22);border-radius:14px;padding:20px 22px;color:#c8d8f0;z-index:10;width:230px;box-shadow:0 0 40px rgba(0,100,200,.12)}
+#panel h3{text-align:center;margin-bottom:14px;font-size:14px;font-weight:500;color:#8cf;letter-spacing:2px}
+.cg{margin-bottom:13px}
+.cg label{display:block;font-size:11px;color:#7899bb;margin-bottom:4px;letter-spacing:.5px}
+.cg select,.cg input[type=color]{width:100%;padding:5px 8px;background:rgba(255,255,255,.07);border:1px solid rgba(0,200,255,.18);border-radius:6px;color:#dde;outline:none;font-size:13px}
+.cg select option{background:#12122a}
+.cg input[type=range]{-webkit-appearance:none;width:100%;height:4px;background:rgba(0,200,255,.18);border-radius:2px;outline:none;margin-top:6px}
+.cg input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:#0cf;border-radius:50%;cursor:pointer}
+.val{text-align:right;font-size:11px;color:#6a8aaa;margin-top:2px}
+#loading{position:fixed;top:0;left:0;width:100%;height:100%;background:#000;display:flex;align-items:center;justify-content:center;z-index:999;flex-direction:column;gap:16px;transition:opacity .6s}
+#loading.hidden{opacity:0;pointer-events:none}
+#loading .txt{color:#4af;font-size:15px;letter-spacing:2px}
+@keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
+#loading .dot{animation:pulse 1.5s infinite}
+</style>
+</head>
+<body>
+
+<div id="loading"><div class="txt">正在加载 3D 引擎与手势模型…</div><div class="txt dot">.</div></div>
+<div id="gesture-badge">✨ 自由流动</div>
+
+<div id="panel">
+  <h3>✦ 控制面板</h3>
+  <div class="cg">
+    <label>粒子形状</label>
+    <select id="sel-shape">
+      <option value="scatter">自由流动</option>
+      <option value="heart">❤️ 爱心</option>
+      <option value="text">☀️ 早安</option>
+    </select>
+  </div>
+  <div class="cg">
+    <label>粒子颜色</label>
+    <input type="color" id="inp-color" value="#00ccff">
+  </div>
+  <div class="cg">
+    <label>粒子数量</label>
+    <input type="range" id="inp-count" min="1000" max="12000" value="5000" step="500">
+    <div class="val" id="val-count">5000</div>
+  </div>
+</div>
+
+<div id="cam-box">
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="cam-canvas" width="320" height="240"></canvas>
+  <div id="cam-label">手势识别中…</div>
+</div>
+
+<!-- ====== Import Map (ES module resolution for Three.js) ====== -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.152.2/examples/jsm/"
+  }
+}
+</script>
+
+<!-- ====== MediaPipe (load as globals, execute before module scripts) ====== -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
+
+<!-- ====== Main Script (ES module) ====== -->
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import 'three/addons/shaders/CopyShader.js';
+import 'three/addons/shaders/LuminosityHighPassShader.js';
+
+/* ============================================================
+   3D Particle Gesture Interaction
+   握拳 → 爱心 | 张掌 → 散开 | 比耶 → 早安
+   ============================================================ */
+
+let scene, camera, renderer, composer, particleSystem;
+const clock = new THREE.Clock();
+const PARTICLE_DEFAULT = 5000;
+let particleCount = PARTICLE_DEFAULT;
+let currentShape = 'scatter';
+let targetPositions = [];
+let baseColor = new THREE.Color(0x00ccff);
+let time = 0;
+
+let handsReady = false;
+let gestureState = 'scatter';
+
+const badge   = document.getElementById('gesture-badge');
+const loading = document.getElementById('loading');
+
+// ---------- init ----------
+try {
+  initThree();
+  initParticles(particleCount);
+  await initCamera();
+  initUI();
+  loading.classList.add('hidden');
+  animate();
+} catch (e) {
+  console.error('Init error:', e);
+  loading.querySelector('.txt').textContent = '加载出错: ' + (e.message || e);
+  loading.querySelector('.dot').textContent = '';
+}
+
+// ==========================================
+//  THREE.JS
+// ==========================================
+function initThree() {
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 200);
+  camera.position.set(0, 0, 22);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setClearColor(0x000000);
+  renderer.domElement.id = 'three';
+  document.body.prepend(renderer.domElement);
+
+  const res = new THREE.Vector2(innerWidth, innerHeight);
+  composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  composer.addPass(new UnrealBloomPass(res, 1.6, 0.5, 0.0));
+
+  window.addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+    composer.setSize(innerWidth, innerHeight);
+  });
+}
+
+// ==========================================
+//  PARTICLE SYSTEM
+// ==========================================
+function initParticles(count) {
+  if (particleSystem) {
+    scene.remove(particleSystem);
+    particleSystem.geometry.dispose();
+    particleSystem.material.dispose();
+  }
+
+  particleCount = count;
+  const geo = new THREE.BufferGeometry();
+  const pos  = new Float32Array(count * 3);
+  const col  = new Float32Array(count * 3);
+  targetPositions = new Array(count);
+
+  for (let i = 0; i < count; i++) {
+    const i3 = i * 3;
+    pos[i3]     = (Math.random() - 0.5) * 24;
+    pos[i3 + 1] = (Math.random() - 0.5) * 24;
+    pos[i3 + 2] = (Math.random() - 0.5) * 24;
+    targetPositions[i] = { x: pos[i3], y: pos[i3 + 1], z: pos[i3 + 2] };
+
+    const hsl = { h: 0, s: 0, l: 0 };
+    baseColor.getHSL(hsl);
+    const c = new THREE.Color().setHSL(
+      hsl.h + (Math.random() - 0.5) * 0.06,
+      hsl.s,
+      hsl.l + (Math.random() - 0.5) * 0.12
+    );
+    col[i3] = c.r; col[i3 + 1] = c.g; col[i3 + 2] = c.b;
+  }
+
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color',    new THREE.BufferAttribute(col, 3));
+
+  const mat = new THREE.PointsMaterial({
+    size: 0.14,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.92,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    sizeAttenuation: true
+  });
+
+  particleSystem = new THREE.Points(geo, mat);
+  scene.add(particleSystem);
+}
+
+function regenerateColors() {
+  const col = particleSystem.geometry.attributes.color.array;
+  const hsl = { h: 0, s: 0, l: 0 };
+  baseColor.getHSL(hsl);
+  for (let i = 0; i < particleCount; i++) {
+    const i3 = i * 3;
+    const c = new THREE.Color().setHSL(
+      hsl.h + (Math.random() - 0.5) * 0.06,
+      hsl.s,
+      hsl.l + (Math.random() - 0.5) * 0.12
+    );
+    col[i3] = c.r; col[i3 + 1] = c.g; col[i3 + 2] = c.b;
+  }
+  particleSystem.geometry.attributes.color.needsUpdate = true;
+}
+
+// ==========================================
+//  SHAPE GENERATORS
+// ==========================================
+function generateHeart() {
+  const pts = [];
+  const n = 1500;
+  for (let i = 0; i < n; i++) {
+    const t = (i / n) * Math.PI * 2;
+    const s = 0.16;
+    pts.push({
+      x: 16 * Math.pow(Math.sin(t), 3) * s,
+      y: (13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t)) * s,
+      z: (Math.random() - 0.5) * 0.4
+    });
+  }
+  for (let i = 0; i < 3500; i++) {
+    const t = Math.random() * Math.PI * 2;
+    const r = Math.random();
+    const s = 0.16 * r;
+    pts.push({
+      x: 16 * Math.pow(Math.sin(t), 3) * s,
+      y: (13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t)) * s,
+      z: (Math.random() - 0.5) * 0.8 * r
+    });
+  }
+  return pts;
+}
+
+function generateText() {
+  const W = 480, H = 200;
+  const cvs = document.createElement('canvas');
+  cvs.width = W; cvs.height = H;
+  const ctx = cvs.getContext('2d');
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 120px "PingFang SC","Microsoft YaHei","SimHei",sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('早安', W / 2, H / 2);
+
+  const img = ctx.getImageData(0, 0, W, H).data;
+  const pts = [];
+  for (let py = 0; py < H; py += 3) {
+    for (let px = 0; px < W; px += 3) {
+      if (img[(py * W + px) * 4 + 3] > 100) {
+        pts.push({
+          x:  (px / W - 0.5) * 14,
+          y: -(py / H - 0.5) * 7,
+          z:  (Math.random() - 0.5) * 0.3
+        });
+      }
+    }
+  }
+  return pts;
+}
+
+function generateScatter() {
+  const pts = [];
+  for (let i = 0; i < particleCount; i++) {
+    pts.push({
+      x: (Math.random() - 0.5) * 24,
+      y: (Math.random() - 0.5) * 24,
+      z: (Math.random() - 0.5) * 24
+    });
+  }
+  return pts;
+}
+
+function applyShape(name) {
+  currentShape = name;
+  let shapePts;
+  switch (name) {
+    case 'heart': shapePts = generateHeart(); break;
+    case 'text':  shapePts = generateText();  break;
+    default:      shapePts = generateScatter();
+  }
+  for (let i = 0; i < particleCount; i++) {
+    targetPositions[i] = shapePts[i % shapePts.length];
+  }
+}
+
+// ==========================================
+//  CAMERA + HAND TRACKING
+// ==========================================
+async function initCamera() {
+  const video = document.getElementById('webcam');
+  const camCvs = document.getElementById('cam-canvas');
+  const camLabel = document.getElementById('cam-label');
+
+  if (typeof Hands === 'undefined') throw new Error('MediaPipe Hands 未加载，请检查网络');
+
+  const hands = new Hands({
+    locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`
+  });
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.5
+  });
+
+  hands.onResults(results => {
+    const ctx = camCvs.getContext('2d');
+    ctx.save();
+    ctx.clearRect(0, 0, 320, 240);
+    ctx.translate(320, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(results.image, 0, 0, 320, 240);
+    ctx.restore();
+
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+      const lm = results.multiHandLandmarks[0];
+      drawLandmarks(camCvs, lm);
+
+      const g = detectGesture(lm);
+      if (g !== gestureState) {
+        gestureState = g;
+        applyGestureShape(g);
+        updateBadge(g);
+      }
+      handsReady = true;
+      camLabel.textContent = '手势: ' + gestureLabel(g);
+      camLabel.style.color = '#0f8';
+    } else {
+      if (handsReady && gestureState !== 'scatter') {
+        gestureState = 'scatter';
+        applyShape(currentShape);
+        updateBadge('scatter');
+      }
+      camLabel.textContent = '请伸出手…';
+      camLabel.style.color = '#f84';
+    }
+  });
+
+  if (typeof Camera !== 'undefined') {
+    const cam = new Camera(video, {
+      onFrame: async () => { await hands.send({ image: video }); },
+      width: 320, height: 240
+    });
+    await cam.start();
+  } else {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240, facingMode: 'user' } });
+    video.srcObject = stream;
+    await video.play();
+    (function loop() {
+      if (video.readyState >= 2) hands.send({ image: video });
+      requestAnimationFrame(loop);
+    })();
+  }
+}
+
+const HAND_CONNS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17]
+];
+
+function drawLandmarks(cvs, lm) {
+  const ctx = cvs.getContext('2d');
+  ctx.strokeStyle = 'rgba(0,200,255,.55)';
+  ctx.lineWidth = 1.5;
+  for (const [a, b] of HAND_CONNS) {
+    ctx.beginPath();
+    ctx.moveTo((1-lm[a].x)*320, lm[a].y*240);
+    ctx.lineTo((1-lm[b].x)*320, lm[b].y*240);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#0cf';
+  for (const p of lm) {
+    ctx.beginPath();
+    ctx.arc((1-p.x)*320, p.y*240, 2.5, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+function detectGesture(lm) {
+  const indexExt  = lm[8].y  < lm[6].y;
+  const middleExt = lm[12].y < lm[10].y;
+  const ringExt   = lm[16].y < lm[14].y;
+  const pinkyExt  = lm[20].y < lm[18].y;
+
+  if (indexExt && middleExt && !ringExt && !pinkyExt) return 'peace';
+  if (indexExt && middleExt && ringExt && pinkyExt) return 'open';
+  if (!indexExt && !middleExt && !ringExt && !pinkyExt) return 'fist';
+  return 'scatter';
+}
+
+function gestureLabel(g) {
+  return { fist:'✊ 握拳 — 爱心', open:'✋ 手掌 — 散开', peace:'✌️ 比耶 — 早安' }[g] || '👀 自由流动';
+}
+
+function applyGestureShape(g) {
+  if (g === 'fist')  applyShape('heart');
+  if (g === 'peace') applyShape('text');
+  if (g === 'open')  applyShape('scatter');
+}
+
+function updateBadge(g) {
+  badge.textContent = { fist:'❤️ 粒子聚成爱心', open:'✨ 粒子散开', peace:'☀️ 早安' }[g] || '✨ 自由流动';
+}
+
+// ==========================================
+//  ANIMATION LOOP
+// ==========================================
+function animate() {
+  requestAnimationFrame(animate);
+  time += clock.getDelta();
+
+  const posAttr = particleSystem.geometry.attributes.position;
+  const arr = posAttr.array;
+
+  for (let i = 0; i < particleCount; i++) {
+    const i3 = i * 3;
+    const tx = targetPositions[i].x;
+    const ty = targetPositions[i].y;
+    const tz = targetPositions[i].z;
+
+    if (currentShape === 'scatter') {
+      arr[i3]     += (tx - arr[i3])     * 0.004 + Math.sin(time*0.7 + i*0.007) * 0.008;
+      arr[i3 + 1] += (ty - arr[i3 + 1]) * 0.004 + Math.cos(time*0.5 + i*0.009) * 0.008;
+      arr[i3 + 2] += (tz - arr[i3 + 2]) * 0.004 + Math.sin(time*0.6 + i*0.005) * 0.006;
+    } else {
+      arr[i3]     += (tx - arr[i3])     * 0.045;
+      arr[i3 + 1] += (ty - arr[i3 + 1]) * 0.045;
+      arr[i3 + 2] += (tz - arr[i3 + 2]) * 0.045;
+    }
+  }
+
+  posAttr.needsUpdate = true;
+  composer.render();
+}
+
+// ==========================================
+//  UI CONTROLS
+// ==========================================
+function initUI() {
+  const selShape = document.getElementById('sel-shape');
+  const inpColor = document.getElementById('inp-color');
+  const inpCount = document.getElementById('inp-count');
+  const valCount = document.getElementById('val-count');
+
+  selShape.addEventListener('change', e => applyShape(e.target.value));
+
+  inpColor.addEventListener('input', e => {
+    baseColor.set(e.target.value);
+    regenerateColors();
+  });
+
+  inpCount.addEventListener('input', e => { valCount.textContent = e.target.value; });
+  inpCount.addEventListener('change', e => {
+    initParticles(parseInt(e.target.value));
+    applyShape(currentShape);
+  });
+}
+</script>
+</body>
+</html>
